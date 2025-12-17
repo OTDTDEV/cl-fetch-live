@@ -20,6 +20,7 @@ const ENV_REQ_URL = process.env.SCHEMA_REQUEST_URL?.trim() || null;
 const ENV_RCPT_URL = process.env.SCHEMA_RECEIPT_URL?.trim() || null;
 
 const REQUEST_PATH = "/fetch/v1.0.0";
+const DEFAULT_PORT = 8080;
 
 /* -------------------- helpers -------------------- */
 
@@ -34,10 +35,12 @@ function sha256Hex(s) {
 function readPemEnv(name) {
   const v = process.env[name];
   if (!v) return null;
+  // Railway-safe: allow multiline PEM stored with literal \n
   return v.replace(/\\n/g, "\n").trim();
 }
 
 function canonicalJson(obj) {
+  // v1: stable enough for now
   return JSON.stringify(obj);
 }
 
@@ -92,33 +95,52 @@ function blocked(url) {
   }
 }
 
+/* -------------------- schema state -------------------- */
+
+let schemaState = {
+  mode: "booting", // booting | ready | degraded
+  ok: false,
+  reqUrl: null,
+  rcptUrl: null,
+  error: null
+};
+
+let validateReq = null;
+let validateRcpt = null;
+
 /* -------------------- always-on routes -------------------- */
 
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 app.get("/debug/env", (_req, res) => {
-  res.json({
-    ok: true,
-    entry: __filename,
-    cwd: process.cwd(),
-    node: process.version,
-    port: Number(process.env.PORT || 8080),
-    service: SERVICE_NAME,
-    ens_name: ENS_NAME,
-    has_rpc: Boolean(ETH_RPC_URL),
-    schema_request_url_env: ENV_REQ_URL,
-    schema_receipt_url_env: ENV_RCPT_URL,
-    has_priv: Boolean(process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM),
-    has_pub: Boolean(process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM),
-    signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME
-  });
+  // must never 500 — this is your lifeline
+  try {
+    res.status(200).json({
+      ok: true,
+      node: process.version,
+      cwd: process.cwd(),
+      port: Number(process.env.PORT || DEFAULT_PORT),
+      service: SERVICE_NAME,
+      ens_name: ENS_NAME,
+      has_rpc: Boolean(ETH_RPC_URL),
+      schema_request_url_env: ENV_REQ_URL,
+      schema_receipt_url_env: ENV_RCPT_URL,
+      signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME,
+      has_priv: Boolean(process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM),
+      has_pub: Boolean(process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM),
+      schema_state: schemaState
+    });
+  } catch (e) {
+    res.status(200).json({ ok: false, error: String(e?.message ?? e) });
+  }
 });
 
-/* -------------------- schema loading (non-blocking) -------------------- */
+app.post("/debug/reload-schemas", async (_req, res) => {
+  await initSchemas();
+  res.status(200).json({ ok: true, schema_state: schemaState });
+});
 
-let schemaState = { mode: "booting", ok: false, reqUrl: null, rcptUrl: null, error: null };
-let validateReq = null;
-let validateRcpt = null;
+/* -------------------- ENS resolution -------------------- */
 
 async function resolveSchemasFromENS() {
   if (!ETH_RPC_URL || !ENS_NAME) throw new Error("Missing ETH_RPC_URL or ENS_NAME");
@@ -133,6 +155,8 @@ async function resolveSchemasFromENS() {
 
   return { reqUrl, rcptUrl };
 }
+
+/* -------------------- schema loading -------------------- */
 
 async function buildValidators(reqUrl, rcptUrl) {
   const ajv = new Ajv2020({
@@ -175,6 +199,7 @@ async function initSchemas() {
   } catch (e) {
     validateReq = null;
     validateRcpt = null;
+
     schemaState = {
       mode: "degraded",
       ok: false,
@@ -182,6 +207,7 @@ async function initSchemas() {
       rcptUrl: ENV_RCPT_URL,
       error: String(e?.message ?? e)
     };
+
     console.error("Schemas DEGRADED:", schemaState.error);
   }
 }
@@ -189,7 +215,6 @@ async function initSchemas() {
 /* -------------------- runtime route -------------------- */
 
 app.post(REQUEST_PATH, async (req, res) => {
-  // Never hang. If schemas aren't ready, be explicit.
   if (!validateReq || !validateRcpt) {
     return res.status(503).json({
       error: "schemas not ready",
@@ -201,7 +226,10 @@ app.post(REQUEST_PATH, async (req, res) => {
     const request = req.body;
 
     if (!validateReq(request)) {
-      return res.status(400).json({ error: "request schema invalid", details: validateReq.errors });
+      return res.status(400).json({
+        error: "request schema invalid",
+        details: validateReq.errors
+      });
     }
 
     const url = request.source;
@@ -249,7 +277,10 @@ app.post(REQUEST_PATH, async (req, res) => {
     attachReceiptProof(receipt);
 
     if (!validateRcpt(receipt)) {
-      return res.status(500).json({ error: "receipt schema invalid", details: validateRcpt.errors });
+      return res.status(500).json({
+        error: "receipt schema invalid",
+        details: validateRcpt.errors
+      });
     }
 
     return res.json(receipt);
@@ -265,7 +296,10 @@ app.post(REQUEST_PATH, async (req, res) => {
     attachReceiptProof(receipt);
 
     if (validateRcpt && !validateRcpt(receipt)) {
-      return res.status(500).json({ error: "receipt schema invalid (error path)", details: validateRcpt.errors });
+      return res.status(500).json({
+        error: "receipt schema invalid (error path)",
+        details: validateRcpt.errors
+      });
     }
 
     return res.status(200).json(receipt);
@@ -274,10 +308,10 @@ app.post(REQUEST_PATH, async (req, res) => {
 
 /* -------------------- start -------------------- */
 
-const port = Number(process.env.PORT || 8080);
+const port = Number(process.env.PORT || DEFAULT_PORT);
 app.listen(port, "0.0.0.0", () => {
   console.log(`listening on ${port}`);
 });
 
-// Do NOT block listening on schema init
+// Non-blocking schema init (server is already reachable)
 initSchemas();
