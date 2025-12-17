@@ -38,7 +38,6 @@ function readPemEnv(name) {
 }
 
 function canonicalJson(obj) {
-  // v1: stable enough for now (uses JSON.stringify)
   return JSON.stringify(obj);
 }
 
@@ -93,4 +92,192 @@ function blocked(url) {
   }
 }
 
-/* -------------------- ENS resolution -------------------- */
+/* -------------------- always-on routes -------------------- */
+
+app.get("/health", (_req, res) => res.status(200).send("ok"));
+
+app.get("/debug/env", (_req, res) => {
+  res.json({
+    ok: true,
+    entry: __filename,
+    cwd: process.cwd(),
+    node: process.version,
+    port: Number(process.env.PORT || 8080),
+    service: SERVICE_NAME,
+    ens_name: ENS_NAME,
+    has_rpc: Boolean(ETH_RPC_URL),
+    schema_request_url_env: ENV_REQ_URL,
+    schema_receipt_url_env: ENV_RCPT_URL,
+    has_priv: Boolean(process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM),
+    has_pub: Boolean(process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM),
+    signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME
+  });
+});
+
+/* -------------------- schema loading (non-blocking) -------------------- */
+
+let schemaState = { mode: "booting", ok: false, reqUrl: null, rcptUrl: null, error: null };
+let validateReq = null;
+let validateRcpt = null;
+
+async function resolveSchemasFromENS() {
+  if (!ETH_RPC_URL || !ENS_NAME) throw new Error("Missing ETH_RPC_URL or ENS_NAME");
+
+  const provider = new ethers.JsonRpcProvider(ETH_RPC_URL);
+  const resolver = await provider.getResolver(ENS_NAME);
+  if (!resolver) throw new Error(`No resolver for ${ENS_NAME}`);
+
+  const reqUrl = await resolver.getText("cl.schema.request");
+  const rcptUrl = await resolver.getText("cl.schema.receipt");
+  if (!reqUrl || !rcptUrl) throw new Error("ENS missing schema TXT records");
+
+  return { reqUrl, rcptUrl };
+}
+
+async function buildValidators(reqUrl, rcptUrl) {
+  const ajv = new Ajv2020({
+    strict: true,
+    allErrors: true,
+    loadSchema: async (uri) => (await fetch(uri)).json()
+  });
+  addFormats(ajv);
+
+  const reqSchema = await (await fetch(reqUrl)).json();
+  const rcptSchema = await (await fetch(rcptUrl)).json();
+
+  const vReq = await ajv.compileAsync(reqSchema);
+  const vRcpt = await ajv.compileAsync(rcptSchema);
+
+  return { vReq, vRcpt };
+}
+
+async function initSchemas() {
+  try {
+    schemaState = { mode: "booting", ok: false, reqUrl: null, rcptUrl: null, error: null };
+
+    // Priority: env URLs -> ENS TXT
+    let reqUrl = ENV_REQ_URL;
+    let rcptUrl = ENV_RCPT_URL;
+
+    if (!reqUrl || !rcptUrl) {
+      const ens = await resolveSchemasFromENS();
+      reqUrl = ens.reqUrl;
+      rcptUrl = ens.rcptUrl;
+    }
+
+    const { vReq, vRcpt } = await buildValidators(reqUrl, rcptUrl);
+
+    validateReq = vReq;
+    validateRcpt = vRcpt;
+
+    schemaState = { mode: "ready", ok: true, reqUrl, rcptUrl, error: null };
+    console.log("Schemas READY");
+  } catch (e) {
+    validateReq = null;
+    validateRcpt = null;
+    schemaState = {
+      mode: "degraded",
+      ok: false,
+      reqUrl: ENV_REQ_URL,
+      rcptUrl: ENV_RCPT_URL,
+      error: String(e?.message ?? e)
+    };
+    console.error("Schemas DEGRADED:", schemaState.error);
+  }
+}
+
+/* -------------------- runtime route -------------------- */
+
+app.post(REQUEST_PATH, async (req, res) => {
+  // Never hang. If schemas aren't ready, be explicit.
+  if (!validateReq || !validateRcpt) {
+    return res.status(503).json({
+      error: "schemas not ready",
+      schema: schemaState
+    });
+  }
+
+  try {
+    const request = req.body;
+
+    if (!validateReq(request)) {
+      return res.status(400).json({ error: "request schema invalid", details: validateReq.errors });
+    }
+
+    const url = request.source;
+    if (blocked(url)) {
+      return res.status(400).json({ error: "blocked or invalid source" });
+    }
+
+    const started_at = new Date().toISOString();
+    const trace_id = id("trace");
+
+    const controller = new AbortController();
+    const timeout_ms = Number(process.env.FETCH_TIMEOUT_MS || 8000);
+    const t = setTimeout(() => controller.abort(), timeout_ms);
+
+    let r, text;
+    try {
+      r = await fetch(url, { signal: controller.signal });
+      text = await r.text();
+    } finally {
+      clearTimeout(t);
+    }
+
+    const headers = {};
+    r.headers.forEach((v, k) => (headers[k] = v));
+
+    const receipt = {
+      status: "success",
+      x402: request.x402,
+      trace: { trace_id, started_at, completed_at: new Date().toISOString() },
+      result: {
+        items: [
+          {
+            source: url,
+            query: request.query ?? null,
+            include_metadata: request.include_metadata ?? null,
+            ok: r.ok,
+            http_status: r.status,
+            headers,
+            body_preview: (text || "").slice(0, 2000)
+          }
+        ]
+      }
+    };
+
+    attachReceiptProof(receipt);
+
+    if (!validateRcpt(receipt)) {
+      return res.status(500).json({ error: "receipt schema invalid", details: validateRcpt.errors });
+    }
+
+    return res.json(receipt);
+  } catch (e) {
+    const receipt = {
+      status: "error",
+      x402: { entry: "x402://fetchagent.eth/fetch/v1.0.0", verb: "fetch", version: "1.0.0" },
+      trace: { trace_id: id("trace"), started_at: new Date().toISOString(), completed_at: new Date().toISOString() },
+      error: { code: "RUNTIME_ERROR", message: String(e?.message ?? e), retryable: true },
+      result: { items: [] }
+    };
+
+    attachReceiptProof(receipt);
+
+    if (validateRcpt && !validateRcpt(receipt)) {
+      return res.status(500).json({ error: "receipt schema invalid (error path)", details: validateRcpt.errors });
+    }
+
+    return res.status(200).json(receipt);
+  }
+});
+
+/* -------------------- start -------------------- */
+
+const port = Number(process.env.PORT || 8080);
+app.listen(port, "0.0.0.0", () => {
+  console.log(`listening on ${port}`);
+});
+
+// Do NOT block listening on schema init
+initSchemas();
