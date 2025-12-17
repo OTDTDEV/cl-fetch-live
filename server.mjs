@@ -18,13 +18,18 @@ function sha256Hex(s) {
   return crypto.createHash("sha256").update(s).digest("hex");
 }
 
-function signEd25519(hashHex) {
-  const pem = process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM?.trim();
-  if (!pem) throw new Error("Missing RECEIPT_SIGNING_PRIVATE_KEY_PEM");
+function readPemEnv(name) {
+  const v = process.env[name];
+  if (!v) return null;
+  // Railway/env UIs sometimes store multiline PEM with literal "\n"
+  return v.replace(/\\n/g, "\n").trim();
+}
 
-  // Sign the raw 32-byte hash
-  const msg = Buffer.from(hashHex, "hex");
-  const sig = crypto.sign(null, msg, pem);
+function signEd25519(hashHex) {
+  const pem = readPemEnv("RECEIPT_SIGNING_PRIVATE_KEY_PEM");
+  if (!pem) throw new Error("Missing RECEIPT_SIGNING_PRIVATE_KEY_PEM");
+  const msg = Buffer.from(hashHex, "hex"); // 32-byte hash
+  const sig = crypto.sign(null, msg, pem); // Ed25519 ignores hash alg param
   return sig.toString("base64");
 }
 
@@ -34,21 +39,23 @@ function attachReceiptProof(receipt) {
   if (clone.metadata && clone.metadata.proof) delete clone.metadata.proof;
 
   const hash = sha256Hex(JSON.stringify(clone));
-  const signature = signEd25519(hash);
 
   receipt.metadata = receipt.metadata || {};
   receipt.metadata.proof = {
     alg: "ed25519-sha256",
     canonical: "json-stringify",
     hash_sha256: hash,
-    signature_b64: signature,
-    signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || "cl-fetch-live",
-    public_key_pem: process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM?.trim() || undefined
+    signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || "cl-fetch-live"
   };
 
-  // Remove undefined so output is clean
-  if (receipt.metadata.proof.public_key_pem === undefined) {
-    delete receipt.metadata.proof.public_key_pem;
+  // Never let proof generation crash the request
+  try {
+    receipt.metadata.proof.signature_b64 = signEd25519(hash);
+
+    const pub = readPemEnv("RECEIPT_SIGNING_PUBLIC_KEY_PEM");
+    if (pub) receipt.metadata.proof.public_key_pem = pub;
+  } catch (e) {
+    receipt.metadata.proof.signature_error = String(e?.message ?? e);
   }
 
   return receipt;
@@ -83,7 +90,6 @@ function blocked(url) {
 async function resolveSchemasFromENS() {
   const rpc = process.env.ETH_RPC_URL?.trim();
   const ensName = process.env.ENS_NAME?.trim();
-
   if (!rpc || !ensName) throw new Error("Missing ETH_RPC_URL or ENS_NAME");
 
   const provider = new ethers.JsonRpcProvider(rpc);
@@ -124,43 +130,62 @@ const validateRcpt = await ajv.compileAsync(rcptSchema);
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 app.post("/fetch/v1.0.0", async (req, res) => {
-  const request = req.body;
-
-  // validate request
-  if (!validateReq(request)) {
-    return res.status(400).json({
-      error: "request schema invalid",
-      details: validateReq.errors
-    });
-  }
-
-  const url = request.source;
-  if (!url || blocked(url)) {
-    return res.status(400).json({ error: "blocked or invalid source" });
-  }
-
-  const startedAt = new Date().toISOString();
-
-  // execute
-  let response, text;
   try {
-    response = await fetch(url);
-    text = await response.text();
-  } catch (e) {
+    const request = req.body;
+
+    // validate request
+    if (!validateReq(request)) {
+      return res.status(400).json({
+        error: "request schema invalid",
+        details: validateReq.errors
+      });
+    }
+
+    const url = request.source;
+    if (!url || blocked(url)) {
+      return res.status(400).json({ error: "blocked or invalid source" });
+    }
+
+    const startedAt = new Date().toISOString();
+    const traceId = id("trace");
+
+    // outbound fetch with hard timeout so we never hang
+    const controller = new AbortController();
+    const timeoutMs = 8000;
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+
+    let response, text;
+    try {
+      response = await fetch(url, { signal: controller.signal });
+      text = await response.text();
+    } finally {
+      clearTimeout(t);
+    }
+
+    const headers = {};
+    response.headers.forEach((v, k) => (headers[k] = v));
+
     const receipt = {
-      status: "error",
+      status: "success",
       x402: request.x402,
       trace: {
-        trace_id: id("trace"),
+        trace_id: traceId,
         started_at: startedAt,
         completed_at: new Date().toISOString()
       },
-      error: {
-        code: "FETCH_FAILED",
-        message: String(e?.message ?? e),
-        retryable: true
-      },
-      result: { items: [] }
+      result: {
+        items: [
+          {
+            source: url,
+            query: request.query ?? null,
+            include_metadata: request.include_metadata ?? null,
+            ok: response.ok,
+            http_status: response.status,
+            headers,
+            body_preview: (text || "").slice(0, 2000)
+          }
+        ]
+      }
     };
 
     attachReceiptProof(receipt);
@@ -173,44 +198,36 @@ app.post("/fetch/v1.0.0", async (req, res) => {
     }
 
     return res.json(receipt);
-  }
+  } catch (e) {
+    // Guaranteed response path (no 502 timeouts)
+    const receipt = {
+      status: "error",
+      x402: {
+        entry: "x402://fetchagent.eth/fetch/v1.0.0",
+        verb: "fetch",
+        version: "1.0.0"
+      },
+      trace: { trace_id: id("trace"), started_at: new Date().toISOString(), completed_at: new Date().toISOString() },
+      error: {
+        code: "RUNTIME_ERROR",
+        message: String(e?.message ?? e),
+        retryable: true
+      },
+      result: { items: [] }
+    };
 
-  const headers = {};
-  response.headers.forEach((v, k) => (headers[k] = v));
+    attachReceiptProof(receipt);
 
-  const receipt = {
-    status: "success",
-    x402: request.x402,
-    trace: {
-      trace_id: id("trace"),
-      started_at: startedAt,
-      completed_at: new Date().toISOString()
-    },
-    result: {
-      items: [
-        {
-          source: url,
-          query: request.query ?? null,
-          include_metadata: request.include_metadata ?? null,
-          ok: response.ok,
-          http_status: response.status,
-          headers,
-          body_preview: text.slice(0, 2000)
-        }
-      ]
+    // If this fails, return raw error (should be rare)
+    if (!validateRcpt(receipt)) {
+      return res.status(500).json({
+        error: "receipt schema invalid (error path)",
+        details: validateRcpt.errors
+      });
     }
-  };
 
-  attachReceiptProof(receipt);
-
-  if (!validateRcpt(receipt)) {
-    return res.status(500).json({
-      error: "receipt schema invalid",
-      details: validateRcpt.errors
-    });
+    return res.status(200).json(receipt);
   }
-
-  return res.json(receipt);
 });
 
 /* -------------------- start -------------------- */
