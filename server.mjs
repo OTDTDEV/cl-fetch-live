@@ -1,4 +1,5 @@
-console.log("🔥 SERVER.MJS BOOTED 🔥");
+console.log("SERVER.MJS BOOTED");
+
 import express from "express";
 import fetch from "node-fetch";
 import Ajv2020 from "ajv/dist/2020.js";
@@ -37,8 +38,7 @@ function readPemEnv(name) {
 }
 
 function canonicalJson(obj) {
-  // For v1: stable enough for now (your receipts already rely on this)
-  // If you want *true* canonical JSON later, use a canonicalizer lib.
+  // v1: stable enough for now (uses JSON.stringify)
   return JSON.stringify(obj);
 }
 
@@ -51,7 +51,6 @@ function signEd25519(hashHex) {
 }
 
 function attachReceiptProof(receipt) {
-  // hash should be computed without the proof itself
   const clone = structuredClone(receipt);
   if (clone?.metadata?.proof) delete clone.metadata.proof;
 
@@ -94,4 +93,4 @@ function blocked(url) {
   }
 }
 
-/* --*
+/* -------------------- ENS resolution -------------------- */
