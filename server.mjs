@@ -43,7 +43,7 @@ function attachReceiptProof(receipt) {
     alg: "ed25519-sha256",
     canonical: "json-stringify",
     hash_sha256: hash,
-    signer_id: process.env.RECEIPT_SIGNER_ID || "cl-fetch-live"
+    signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || "cl-fetch-live"
   };
 
   try {
@@ -53,13 +53,33 @@ function attachReceiptProof(receipt) {
   } catch (e) {
     receipt.metadata.proof.signature_error = String(e?.message ?? e);
   }
+
+  return receipt;
+}
+
+// SSRF guard for demo safety
+function blocked(url) {
+  try {
+    const u = new URL(url);
+    const h = u.hostname;
+
+    if (u.protocol !== "http:" && u.protocol !== "https:") return true;
+
+    return (
+      h === "localhost" ||
+      h.endsWith(".local") ||
+      /^127\.|^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[0-1])\./.test(h)
+    );
+  } catch {
+    return true;
+  }
 }
 
 /* -------------------- ENS resolution -------------------- */
 
 async function resolveSchemasFromENS() {
-  const rpc = process.env.ETH_RPC_URL;
-  const ens = process.env.ENS_NAME;
+  const rpc = process.env.ETH_RPC_URL?.trim();
+  const ens = process.env.ENS_NAME?.trim();
   if (!rpc || !ens) throw new Error("Missing ETH_RPC_URL or ENS_NAME");
 
   const provider = new ethers.JsonRpcProvider(rpc);
@@ -92,46 +112,72 @@ const validateRcpt = await ajv.compileAsync(await (await fetch(RCPT_URL)).json()
 
 /* -------------------- routes -------------------- */
 
-app.get("/health", (_req, res) => res.send("ok"));
+app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 app.get("/debug/env", (_req, res) => {
   res.json({
     has_priv: Boolean(process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM),
     has_pub: Boolean(process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM),
-    signer_id: process.env.RECEIPT_SIGNER_ID || null
+    signer_id: process.env.RECEIPT_SIGNER_ID || null,
+    ens_name: process.env.ENS_NAME || null
   });
 });
 
 app.post("/fetch/v1.0.0", async (req, res) => {
   try {
-    if (!validateReq(req.body)) {
+    const request = req.body;
+
+    if (!validateReq(request)) {
       return res.status(400).json({
         error: "request schema invalid",
         details: validateReq.errors
       });
     }
 
-    const traceId = id("trace");
-    const started = new Date().toISOString();
+    const url = request.source;
+    if (blocked(url)) {
+      return res.status(400).json({ error: "blocked or invalid source" });
+    }
 
-    const r = await fetch(req.body.source);
-    const text = await r.text();
+    const started_at = new Date().toISOString();
+    const trace_id = id("trace");
+
+    // hard timeout so it never hangs -> no Railway 502 timeouts
+    const controller = new AbortController();
+    const timeout_ms = 8000;
+    const t = setTimeout(() => controller.abort(), timeout_ms);
+
+    let r, text;
+    try {
+      r = await fetch(url, { signal: controller.signal });
+      text = await r.text();
+    } finally {
+      clearTimeout(t);
+    }
+
+    const headers = {};
+    r.headers.forEach((v, k) => (headers[k] = v));
 
     const receipt = {
       status: "success",
-      x402: req.body.x402,
+      x402: request.x402,
       trace: {
-        trace_id: traceId,
-        started_at: started,
+        trace_id,
+        started_at,
         completed_at: new Date().toISOString()
       },
       result: {
-        items: [{
-          source: req.body.source,
-          ok: r.ok,
-          http_status: r.status,
-          body_preview: text.slice(0, 2000)
-        }]
+        items: [
+          {
+            source: url,
+            query: request.query ?? null,
+            include_metadata: request.include_metadata ?? null,
+            ok: r.ok,
+            http_status: r.status,
+            headers,
+            body_preview: (text || "").slice(0, 2000)
+          }
+        ]
       }
     };
 
@@ -144,13 +190,43 @@ app.post("/fetch/v1.0.0", async (req, res) => {
       });
     }
 
-    res.json(receipt);
+    return res.json(receipt);
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    // Always respond (never hang)
+    const receipt = {
+      status: "error",
+      x402: {
+        entry: "x402://fetchagent.eth/fetch/v1.0.0",
+        verb: "fetch",
+        version: "1.0.0"
+      },
+      trace: {
+        trace_id: id("trace"),
+        started_at: new Date().toISOString(),
+        completed_at: new Date().toISOString()
+      },
+      error: {
+        code: "RUNTIME_ERROR",
+        message: String(e?.message ?? e),
+        retryable: true
+      },
+      result: { items: [] }
+    };
+
+    attachReceiptProof(receipt);
+
+    if (!validateRcpt(receipt)) {
+      return res.status(500).json({
+        error: "receipt schema invalid (error path)",
+        details: validateRcpt.errors
+      });
+    }
+
+    return res.status(200).json(receipt);
   }
 });
 
 /* -------------------- start -------------------- */
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("listening on", port));
+const port = Number(process.env.PORT || 3000);
+app.listen(port, () => console.log(`listening on ${port}`));
