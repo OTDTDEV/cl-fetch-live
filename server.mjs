@@ -1,4 +1,5 @@
 // inside app.post("/fetch/v1.0.0", ...)
+console.log("FETCH v1.0.0 BODY:", JSON.stringify(req.body).slice(0, 500));
 
 const url = request.source;              // <-- schema says source is a string
 const maxItems = request.max_items ?? 1; // <-- optional
