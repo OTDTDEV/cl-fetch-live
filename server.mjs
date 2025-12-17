@@ -1,5 +1,4 @@
 console.log("🔥 SERVER.MJS BOOTED 🔥");
-
 import express from "express";
 import fetch from "node-fetch";
 import Ajv2020 from "ajv/dist/2020.js";
