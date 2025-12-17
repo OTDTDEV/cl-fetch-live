@@ -18,17 +18,38 @@ function sha256Hex(s) {
   return crypto.createHash("sha256").update(s).digest("hex");
 }
 
-function attachReceiptHash(receipt) {
+function signEd25519(hashHex) {
+  const pem = process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM?.trim();
+  if (!pem) throw new Error("Missing RECEIPT_SIGNING_PRIVATE_KEY_PEM");
+
+  // Sign the raw 32-byte hash
+  const msg = Buffer.from(hashHex, "hex");
+  const sig = crypto.sign(null, msg, pem);
+  return sig.toString("base64");
+}
+
+function attachReceiptProof(receipt) {
+  // Hash the receipt *without* metadata.proof to avoid recursion
   const clone = structuredClone(receipt);
-  delete clone.metadata?.proof;
+  if (clone.metadata && clone.metadata.proof) delete clone.metadata.proof;
 
   const hash = sha256Hex(JSON.stringify(clone));
+  const signature = signEd25519(hash);
 
   receipt.metadata = receipt.metadata || {};
   receipt.metadata.proof = {
+    alg: "ed25519-sha256",
+    canonical: "json-stringify",
     hash_sha256: hash,
-    canonical: "json-stringify"
+    signature_b64: signature,
+    signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || "cl-fetch-live",
+    public_key_pem: process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM?.trim() || undefined
   };
+
+  // Remove undefined so output is clean
+  if (receipt.metadata.proof.public_key_pem === undefined) {
+    delete receipt.metadata.proof.public_key_pem;
+  }
 
   return receipt;
 }
@@ -43,6 +64,7 @@ async function fetchJson(url) {
   return j;
 }
 
+// basic SSRF guard (demo-safe)
 function blocked(url) {
   try {
     const h = new URL(url).hostname;
@@ -88,7 +110,7 @@ const RCPT_URL = ensResolved.rcptUrl;
 const ajv = new Ajv2020({
   strict: true,
   allErrors: true,
-  loadSchema: async (uri) => fetchJson(uri),
+  loadSchema: async (uri) => fetchJson(uri)
 });
 addFormats(ajv);
 
@@ -104,6 +126,7 @@ app.get("/health", (_req, res) => res.status(200).send("ok"));
 app.post("/fetch/v1.0.0", async (req, res) => {
   const request = req.body;
 
+  // validate request
   if (!validateReq(request)) {
     return res.status(400).json({
       error: "request schema invalid",
@@ -117,8 +140,9 @@ app.post("/fetch/v1.0.0", async (req, res) => {
   }
 
   const startedAt = new Date().toISOString();
-  let response, text;
 
+  // execute
+  let response, text;
   try {
     response = await fetch(url);
     text = await response.text();
@@ -133,13 +157,13 @@ app.post("/fetch/v1.0.0", async (req, res) => {
       },
       error: {
         code: "FETCH_FAILED",
-        message: String(e),
+        message: String(e?.message ?? e),
         retryable: true
       },
       result: { items: [] }
     };
 
-    attachReceiptHash(receipt);
+    attachReceiptProof(receipt);
 
     if (!validateRcpt(receipt)) {
       return res.status(500).json({
@@ -177,7 +201,7 @@ app.post("/fetch/v1.0.0", async (req, res) => {
     }
   };
 
-  attachReceiptHash(receipt);
+  attachReceiptProof(receipt);
 
   if (!validateRcpt(receipt)) {
     return res.status(500).json({
