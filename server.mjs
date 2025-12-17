@@ -14,6 +14,25 @@ function id(prefix) {
   return `${prefix}_${crypto.randomBytes(6).toString("hex")}`;
 }
 
+function sha256Hex(s) {
+  return crypto.createHash("sha256").update(s).digest("hex");
+}
+
+function attachReceiptHash(receipt) {
+  const clone = structuredClone(receipt);
+  delete clone.metadata?.proof;
+
+  const hash = sha256Hex(JSON.stringify(clone));
+
+  receipt.metadata = receipt.metadata || {};
+  receipt.metadata.proof = {
+    hash_sha256: hash,
+    canonical: "json-stringify"
+  };
+
+  return receipt;
+}
+
 const cache = new Map();
 async function fetchJson(url) {
   if (cache.has(url)) return cache.get(url);
@@ -24,11 +43,9 @@ async function fetchJson(url) {
   return j;
 }
 
-// basic SSRF guard (demo-safe)
 function blocked(url) {
   try {
-    const u = new URL(url);
-    const h = u.hostname;
+    const h = new URL(url).hostname;
     return (
       h === "localhost" ||
       h.endsWith(".local") ||
@@ -45,7 +62,7 @@ async function resolveSchemasFromENS() {
   const rpc = process.env.ETH_RPC_URL?.trim();
   const ensName = process.env.ENS_NAME?.trim();
 
-  if (!rpc || !ensName) return null;
+  if (!rpc || !ensName) throw new Error("Missing ETH_RPC_URL or ENS_NAME");
 
   const provider = new ethers.JsonRpcProvider(rpc);
   const resolver = await provider.getResolver(ensName);
@@ -64,19 +81,9 @@ async function resolveSchemasFromENS() {
 
 /* -------------------- schema loading -------------------- */
 
-let REQ_URL = process.env.REQ_URL?.trim();
-let RCPT_URL = process.env.RCPT_URL?.trim();
-
-// prefer ENS, fallback to env
 const ensResolved = await resolveSchemasFromENS();
-if (ensResolved) {
-  REQ_URL = ensResolved.reqUrl;
-  RCPT_URL = ensResolved.rcptUrl;
-}
-
-if (!REQ_URL || !RCPT_URL) {
-  throw new Error("Schema URLs not found (ENS + env fallback failed)");
-}
+const REQ_URL = ensResolved.reqUrl;
+const RCPT_URL = ensResolved.rcptUrl;
 
 const ajv = new Ajv2020({
   strict: true,
@@ -97,11 +104,10 @@ app.get("/health", (_req, res) => res.status(200).send("ok"));
 app.post("/fetch/v1.0.0", async (req, res) => {
   const request = req.body;
 
-  // validate request
   if (!validateReq(request)) {
     return res.status(400).json({
       error: "request schema invalid",
-      details: validateReq.errors,
+      details: validateReq.errors
     });
   }
 
@@ -110,7 +116,9 @@ app.post("/fetch/v1.0.0", async (req, res) => {
     return res.status(400).json({ error: "blocked or invalid source" });
   }
 
+  const startedAt = new Date().toISOString();
   let response, text;
+
   try {
     response = await fetch(url);
     text = await response.text();
@@ -118,18 +126,28 @@ app.post("/fetch/v1.0.0", async (req, res) => {
     const receipt = {
       status: "error",
       x402: request.x402,
-      trace: { trace_id: id("trace") },
-      result: {
-        items: [{ source: url, ok: false, error: String(e) }],
+      trace: {
+        trace_id: id("trace"),
+        started_at: startedAt,
+        completed_at: new Date().toISOString()
       },
+      error: {
+        code: "FETCH_FAILED",
+        message: String(e),
+        retryable: true
+      },
+      result: { items: [] }
     };
+
+    attachReceiptHash(receipt);
 
     if (!validateRcpt(receipt)) {
       return res.status(500).json({
         error: "receipt schema invalid",
-        details: validateRcpt.errors,
+        details: validateRcpt.errors
       });
     }
+
     return res.json(receipt);
   }
 
@@ -139,7 +157,11 @@ app.post("/fetch/v1.0.0", async (req, res) => {
   const receipt = {
     status: "success",
     x402: request.x402,
-    trace: { trace_id: id("trace") },
+    trace: {
+      trace_id: id("trace"),
+      started_at: startedAt,
+      completed_at: new Date().toISOString()
+    },
     result: {
       items: [
         {
@@ -149,16 +171,18 @@ app.post("/fetch/v1.0.0", async (req, res) => {
           ok: response.ok,
           http_status: response.status,
           headers,
-          body_preview: text.slice(0, 2000),
-        },
-      ],
-    },
+          body_preview: text.slice(0, 2000)
+        }
+      ]
+    }
   };
+
+  attachReceiptHash(receipt);
 
   if (!validateRcpt(receipt)) {
     return res.status(500).json({
       error: "receipt schema invalid",
-      details: validateRcpt.errors,
+      details: validateRcpt.errors
     });
   }
 
