@@ -35,12 +35,10 @@ function sha256Hex(s) {
 function readPemEnv(name) {
   const v = process.env[name];
   if (!v) return null;
-  // Railway-safe: allow multiline PEM stored with literal \n
   return v.replace(/\\n/g, "\n").trim();
 }
 
 function canonicalJson(obj) {
-  // v1: stable enough for now
   return JSON.stringify(obj);
 }
 
@@ -53,6 +51,7 @@ function signEd25519(hashHex) {
 }
 
 function attachReceiptProof(receipt) {
+  // Compute hash WITHOUT proof
   const clone = structuredClone(receipt);
   if (clone?.metadata?.proof) delete clone.metadata.proof;
 
@@ -113,7 +112,7 @@ let validateRcpt = null;
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 app.get("/debug/env", (_req, res) => {
-  // must never 500 — this is your lifeline
+  // must never 500
   try {
     res.status(200).json({
       ok: true,
@@ -216,20 +215,14 @@ async function initSchemas() {
 
 app.post(REQUEST_PATH, async (req, res) => {
   if (!validateReq || !validateRcpt) {
-    return res.status(503).json({
-      error: "schemas not ready",
-      schema: schemaState
-    });
+    return res.status(503).json({ error: "schemas not ready", schema: schemaState });
   }
 
   try {
     const request = req.body;
 
     if (!validateReq(request)) {
-      return res.status(400).json({
-        error: "request schema invalid",
-        details: validateReq.errors
-      });
+      return res.status(400).json({ error: "request schema invalid", details: validateReq.errors });
     }
 
     const url = request.source;
@@ -255,6 +248,7 @@ app.post(REQUEST_PATH, async (req, res) => {
     const headers = {};
     r.headers.forEach((v, k) => (headers[k] = v));
 
+    // IMPORTANT: metadata is TOP-LEVEL (base schema), not inside result.
     const receipt = {
       status: "success",
       x402: request.x402,
@@ -271,16 +265,14 @@ app.post(REQUEST_PATH, async (req, res) => {
             body_preview: (text || "").slice(0, 2000)
           }
         ]
-      }
+      },
+      metadata: {}
     };
 
     attachReceiptProof(receipt);
 
     if (!validateRcpt(receipt)) {
-      return res.status(500).json({
-        error: "receipt schema invalid",
-        details: validateRcpt.errors
-      });
+      return res.status(500).json({ error: "receipt schema invalid", details: validateRcpt.errors });
     }
 
     return res.json(receipt);
@@ -290,16 +282,14 @@ app.post(REQUEST_PATH, async (req, res) => {
       x402: { entry: "x402://fetchagent.eth/fetch/v1.0.0", verb: "fetch", version: "1.0.0" },
       trace: { trace_id: id("trace"), started_at: new Date().toISOString(), completed_at: new Date().toISOString() },
       error: { code: "RUNTIME_ERROR", message: String(e?.message ?? e), retryable: true },
-      result: { items: [] }
+      result: { items: [] },
+      metadata: {}
     };
 
     attachReceiptProof(receipt);
 
     if (validateRcpt && !validateRcpt(receipt)) {
-      return res.status(500).json({
-        error: "receipt schema invalid (error path)",
-        details: validateRcpt.errors
-      });
+      return res.status(500).json({ error: "receipt schema invalid (error path)", details: validateRcpt.errors });
     }
 
     return res.status(200).json(receipt);
