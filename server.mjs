@@ -22,7 +22,8 @@ const ENV_RCPT_URL = process.env.SCHEMA_RECEIPT_URL?.trim() || null;
 const REQUEST_PATH = "/fetch/v1.0.0";
 const PORT = Number(process.env.PORT || 8080);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 8000);
-const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 10 * 60 * 1000);
+
+const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 10 * 60 * 1000); // 10 min
 
 /* -------------------- helpers -------------------- */
 
@@ -41,6 +42,7 @@ function readPemEnv(name) {
 }
 
 function canonicalJson(obj) {
+  // v1 canonicalization: JSON.stringify (stable enough for now)
   return JSON.stringify(obj);
 }
 
@@ -74,7 +76,7 @@ function attachReceiptProofOrThrow(receipt) {
   return receipt;
 }
 
-// SSRF guard for demo safety
+// SSRF guard (demo safety)
 function blocked(url) {
   try {
     const u = new URL(url);
@@ -97,37 +99,40 @@ function blocked(url) {
   }
 }
 
-/* -------------------- ENS resolution -------------------- */
+/* -------------------- ENS helpers -------------------- */
 
-async function getEnsResolver() {
-  if (!ETH_RPC_URL || !ENS_NAME) throw new Error("Missing ETH_RPC_URL or ENS_NAME");
-  const provider = new ethers.JsonRpcProvider(ETH_RPC_URL);
+async function getProvider() {
+  if (!ETH_RPC_URL) throw new Error("Missing ETH_RPC_URL");
+  return new ethers.JsonRpcProvider(ETH_RPC_URL);
+}
+
+async function getResolver() {
+  if (!ENS_NAME) throw new Error("Missing ENS_NAME");
+  const provider = await getProvider();
   const resolver = await provider.getResolver(ENS_NAME);
   if (!resolver) throw new Error(`No resolver for ${ENS_NAME}`);
   return resolver;
 }
 
 async function resolveSchemasFromENS() {
-  const resolver = await getEnsResolver();
+  const resolver = await getResolver();
   const reqUrl = await resolver.getText("cl.schema.request");
   const rcptUrl = await resolver.getText("cl.schema.receipt");
-  if (!reqUrl || !rcptUrl) throw new Error("ENS missing schema TXT records");
+  if (!reqUrl || !rcptUrl) throw new Error("ENS missing cl.schema.request or cl.schema.receipt");
   return { reqUrl, rcptUrl };
 }
 
 async function resolveVerifierKeyFromENS() {
-  const resolver = await getEnsResolver();
-  const pub_pem_escaped = await resolver.getText("cl.receipt.pubkey_pem");
-  if (!pub_pem_escaped) throw new Error("ENS missing cl.receipt.pubkey_pem");
+  const resolver = await getResolver();
 
-  const signer_id = (await resolver.getText("cl.receipt.signer_id"))?.trim() || null;
   const alg = (await resolver.getText("cl.receipt.alg"))?.trim() || null;
+  const signer_id = (await resolver.getText("cl.receipt.signer_id"))?.trim() || null;
+  const pubEscaped = await resolver.getText("cl.receipt.pubkey_pem");
 
-  return {
-    alg,
-    signer_id,
-    pubkey_pem: pub_pem_escaped.replace(/\\n/g, "\n").trim(),
-  };
+  if (!pubEscaped) throw new Error("ENS missing cl.receipt.pubkey_pem");
+  const pubkey_pem = pubEscaped.replace(/\\n/g, "\n").trim();
+
+  return { alg, signer_id, pubkey_pem };
 }
 
 /* -------------------- schema loading (non-blocking) -------------------- */
@@ -147,10 +152,10 @@ async function buildValidators(reqUrl, rcptUrl) {
   const reqSchema = await (await fetch(reqUrl)).json();
   const rcptSchema = await (await fetch(rcptUrl)).json();
 
-  return {
-    vReq: await ajv.compileAsync(reqSchema),
-    vRcpt: await ajv.compileAsync(rcptSchema),
-  };
+  const vReq = await ajv.compileAsync(reqSchema);
+  const vRcpt = await ajv.compileAsync(rcptSchema);
+
+  return { vReq, vRcpt };
 }
 
 async function initSchemas() {
@@ -188,21 +193,26 @@ async function initSchemas() {
 
 /* -------------------- ENS verifier key cache -------------------- */
 
-let ensKeyCache = null; // { pubkey_pem, alg, signer_id, cached_at, expires_at, error }
+let ensKeyCache = null; // { alg, signer_id, pubkey_pem, cached_at, expires_at, error }
+
+function cacheValid() {
+  if (!ensKeyCache?.pubkey_pem || !ensKeyCache?.expires_at) return false;
+  return Date.now() < Date.parse(ensKeyCache.expires_at);
+}
 
 async function getEnsVerifierKey({ refresh = false } = {}) {
-  const now = Date.now();
-  if (!refresh && ensKeyCache?.pubkey_pem && ensKeyCache?.expires_at && now < Date.parse(ensKeyCache.expires_at)) {
-    return { ...ensKeyCache, source: "ens-cache" };
-  }
+  if (!refresh && cacheValid()) return { ...ensKeyCache, source: "ens-cache" };
 
+  const now = Date.now();
   const k = await resolveVerifierKeyFromENS();
+
   ensKeyCache = {
     ...k,
     cached_at: new Date(now).toISOString(),
     expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString(),
     error: null,
   };
+
   return { ...ensKeyCache, source: "ens" };
 }
 
@@ -210,14 +220,12 @@ async function getEnsVerifierKey({ refresh = false } = {}) {
 
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-app.get("/debug/env", async (_req, res) => {
+app.get("/debug/env", (_req, res) => {
+  // prove signing is configured (does not leak keys)
   let signer_ok = false;
   let signer_error = null;
-
   try {
-    // sign a dummy hash to prove key is valid
-    const dummy = sha256Hex("debug");
-    signEd25519(dummy);
+    signEd25519(sha256Hex("debug"));
     signer_ok = true;
   } catch (e) {
     signer_error = String(e?.message ?? e);
@@ -237,7 +245,31 @@ app.get("/debug/env", async (_req, res) => {
     signer_ok,
     signer_error,
     schema_state: schemaState,
+    ens_verifier_cache: {
+      has_key: Boolean(ensKeyCache?.pubkey_pem),
+      cached_at: ensKeyCache?.cached_at || null,
+      expires_at: ensKeyCache?.expires_at || null,
+      last_error: ensKeyCache?.error || null,
+    },
   });
+});
+
+app.get("/debug/enskey", async (_req, res) => {
+  try {
+    const k = await getEnsVerifierKey({ refresh: true });
+    res.json({
+      ok: true,
+      ens: ENS_NAME,
+      alg: k.alg,
+      signer_id: k.signer_id,
+      pubkey_source: k.source,
+      pubkey_preview: k.pubkey_pem.slice(0, 40) + "...",
+      cached_at: k.cached_at,
+      expires_at: k.expires_at,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message ?? e) });
+  }
 });
 
 /* -------------------- /verify -------------------- */
@@ -245,22 +277,24 @@ app.get("/debug/env", async (_req, res) => {
 app.post("/verify", async (req, res) => {
   try {
     const receipt = req.body;
-
     const proof = receipt?.metadata?.proof || null;
+
     if (!proof?.signature_b64 || !proof?.hash_sha256) {
       return res.status(400).json({ ok: false, error: "missing metadata.proof.signature_b64 or hash_sha256" });
     }
 
-    // schema validation
+    // schema check
     const schema_valid = validateRcpt ? Boolean(validateRcpt(receipt)) : false;
-    const schema_errors = validateRcpt ? (validateRcpt.errors || null) : [{ message: "receipt validator not ready", schemaState }];
+    const schema_errors = validateRcpt
+      ? (validateRcpt.errors || null)
+      : [{ message: "receipt validator not ready", schemaState }];
 
-    // hash recompute
+    // hash check
     const recomputed_hash = recomputeReceiptHash(receipt);
     const claimed_hash = String(proof.hash_sha256);
     const hash_matches = recomputed_hash === claimed_hash;
 
-    // key selection
+    // key selection (IMPORTANT: ?ens=1 forces ENS key; never read receipt key)
     const requireEns = String(req.query?.ens || "") === "1";
     const refresh = String(req.query?.refresh || "") === "1";
 
@@ -277,10 +311,13 @@ app.post("/verify", async (req, res) => {
     }
 
     if (!pubPem) {
-      return res.status(503).json({ ok: false, error: requireEns ? "ENS verifier key unavailable" : "Missing env verifier key" });
+      return res.status(503).json({
+        ok: false,
+        error: requireEns ? "ENS verifier key unavailable" : "Missing RECEIPT_SIGNING_PUBLIC_KEY_PEM",
+      });
     }
 
-    // signature verify (ed25519 over hash bytes)
+    // signature check (ed25519 over hash bytes)
     let signature_valid = false;
     let signature_error = null;
     try {
@@ -349,7 +386,12 @@ app.post(REQUEST_PATH, async (req, res) => {
     const receipt = {
       status: "success",
       x402: request.x402,
-      trace: { trace_id, started_at, completed_at: new Date().toISOString(), provider: SERVICE_NAME },
+      trace: {
+        trace_id,
+        started_at,
+        completed_at: new Date().toISOString(),
+        provider: SERVICE_NAME,
+      },
       result: {
         items: [
           {
@@ -365,7 +407,7 @@ app.post(REQUEST_PATH, async (req, res) => {
       },
     };
 
-    // If signing fails, fail loudly. No silent unsigned receipts.
+    // NO silent unsigned receipts. If signing fails => 500.
     attachReceiptProofOrThrow(receipt);
 
     if (!validateRcpt(receipt)) {
@@ -374,7 +416,6 @@ app.post(REQUEST_PATH, async (req, res) => {
 
     return res.json(receipt);
   } catch (e) {
-    // If we error before we can sign, return a clear runtime error (not a fake receipt).
     return res.status(500).json({ error: "runtime_error", message: String(e?.message ?? e) });
   }
 });
@@ -385,4 +426,5 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`listening on ${PORT}`);
 });
 
+// do not block server startup
 initSchemas();
