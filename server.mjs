@@ -1,4 +1,4 @@
-console.log("SERVER.MJS BOOTED");
+console.log("SERVER.MJS BOOTED", "BUILD_ID", "2025-12-17T23:59Z");
 
 import express from "express";
 import fetch from "node-fetch";
