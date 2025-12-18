@@ -22,8 +22,7 @@ const ENV_RCPT_URL = process.env.SCHEMA_RECEIPT_URL?.trim() || null;
 const REQUEST_PATH = "/fetch/v1.0.0";
 const PORT = Number(process.env.PORT || 8080);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 8000);
-
-const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 10 * 60 * 1000); // 10 min
+const ENS_CACHE_TTL_MS = Number(process.env.ENS_CACHE_TTL_MS || 10 * 60 * 1000);
 
 /* -------------------- helpers -------------------- */
 
@@ -42,8 +41,13 @@ function readPemEnv(name) {
 }
 
 function canonicalJson(obj) {
-  // v1: stable enough for now (JSON.stringify). Later can move to canonical JSON.
   return JSON.stringify(obj);
+}
+
+function recomputeReceiptHash(receipt) {
+  const clone = structuredClone(receipt);
+  if (clone?.metadata?.proof) delete clone.metadata.proof;
+  return sha256Hex(canonicalJson(clone));
 }
 
 function signEd25519(hashHex) {
@@ -54,13 +58,7 @@ function signEd25519(hashHex) {
   return sig.toString("base64");
 }
 
-function recomputeReceiptHash(receipt) {
-  const clone = structuredClone(receipt);
-  if (clone?.metadata?.proof) delete clone.metadata.proof;
-  return sha256Hex(canonicalJson(clone));
-}
-
-function attachReceiptProof(receipt) {
+function attachReceiptProofOrThrow(receipt) {
   const hash = recomputeReceiptHash(receipt);
 
   receipt.metadata = receipt.metadata || {};
@@ -69,11 +67,10 @@ function attachReceiptProof(receipt) {
     canonical: "json-stringify",
     hash_sha256: hash,
     signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME,
+    signature_b64: signEd25519(hash),
   };
 
-  // IMPORTANT: do NOT embed the public key in receipts
-  receipt.metadata.proof.signature_b64 = signEd25519(hash);
-
+  // IMPORTANT: do NOT embed public key in receipts
   return receipt;
 }
 
@@ -85,54 +82,22 @@ function blocked(url) {
 
     if (u.protocol !== "http:" && u.protocol !== "https:") return true;
 
-    // block common internal ranges + localhost patterns
-    if (
+    return (
       h === "localhost" ||
       h.endsWith(".local") ||
       h === "::1" ||
-      h.startsWith("[::1]") ||
       /^127\./.test(h) ||
       /^10\./.test(h) ||
       /^192\.168\./.test(h) ||
       /^172\.(1[6-9]|2\d|3[0-1])\./.test(h) ||
       /^169\.254\./.test(h) // link-local
-    ) return true;
-
-    return false;
+    );
   } catch {
     return true;
   }
 }
 
-/* -------------------- always-on routes -------------------- */
-
-app.get("/health", (_req, res) => res.status(200).send("ok"));
-
-app.get("/debug/env", (_req, res) => {
-  res.json({
-    ok: true,
-    node: process.version,
-    cwd: process.cwd(),
-    port: PORT,
-    service: SERVICE_NAME,
-    ens_name: ENS_NAME,
-    has_rpc: Boolean(ETH_RPC_URL),
-    schema_request_url_env: ENV_REQ_URL,
-    schema_receipt_url_env: ENV_RCPT_URL,
-    signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME,
-    has_priv: Boolean(process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM),
-    has_pub: Boolean(process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM),
-    schema_state: schemaState,
-    ens_verifier_cache: {
-      has_key: Boolean(ensKeyCache?.pubkey_pem),
-      cached_at: ensKeyCache?.cached_at || null,
-      expires_at: ensKeyCache?.expires_at || null,
-      last_error: ensKeyCache?.error || null,
-    },
-  });
-});
-
-/* -------------------- ENS resolution (schemas + verifier key) -------------------- */
+/* -------------------- ENS resolution -------------------- */
 
 async function getEnsResolver() {
   if (!ETH_RPC_URL || !ENS_NAME) throw new Error("Missing ETH_RPC_URL or ENS_NAME");
@@ -146,22 +111,23 @@ async function resolveSchemasFromENS() {
   const resolver = await getEnsResolver();
   const reqUrl = await resolver.getText("cl.schema.request");
   const rcptUrl = await resolver.getText("cl.schema.receipt");
-  if (!reqUrl || !rcptUrl) throw new Error("ENS missing schema TXT records (cl.schema.request / cl.schema.receipt)");
+  if (!reqUrl || !rcptUrl) throw new Error("ENS missing schema TXT records");
   return { reqUrl, rcptUrl };
 }
 
 async function resolveVerifierKeyFromENS() {
   const resolver = await getEnsResolver();
-
-  const alg = (await resolver.getText("cl.receipt.alg"))?.trim() || null;
-  const signer_id = (await resolver.getText("cl.receipt.signer_id"))?.trim() || null;
   const pub_pem_escaped = await resolver.getText("cl.receipt.pubkey_pem");
-
   if (!pub_pem_escaped) throw new Error("ENS missing cl.receipt.pubkey_pem");
 
-  const pubkey_pem = pub_pem_escaped.replace(/\\n/g, "\n").trim();
+  const signer_id = (await resolver.getText("cl.receipt.signer_id"))?.trim() || null;
+  const alg = (await resolver.getText("cl.receipt.alg"))?.trim() || null;
 
-  return { alg, signer_id, pubkey_pem };
+  return {
+    alg,
+    signer_id,
+    pubkey_pem: pub_pem_escaped.replace(/\\n/g, "\n").trim(),
+  };
 }
 
 /* -------------------- schema loading (non-blocking) -------------------- */
@@ -181,17 +147,16 @@ async function buildValidators(reqUrl, rcptUrl) {
   const reqSchema = await (await fetch(reqUrl)).json();
   const rcptSchema = await (await fetch(rcptUrl)).json();
 
-  const vReq = await ajv.compileAsync(reqSchema);
-  const vRcpt = await ajv.compileAsync(rcptSchema);
-
-  return { vReq, vRcpt };
+  return {
+    vReq: await ajv.compileAsync(reqSchema),
+    vRcpt: await ajv.compileAsync(rcptSchema),
+  };
 }
 
 async function initSchemas() {
   try {
     schemaState = { mode: "booting", ok: false, reqUrl: null, rcptUrl: null, error: null };
 
-    // Priority: env URLs -> ENS TXT
     let reqUrl = ENV_REQ_URL;
     let rcptUrl = ENV_RCPT_URL;
 
@@ -202,12 +167,11 @@ async function initSchemas() {
     }
 
     const { vReq, vRcpt } = await buildValidators(reqUrl, rcptUrl);
-
     validateReq = vReq;
     validateRcpt = vRcpt;
 
     schemaState = { mode: "ready", ok: true, reqUrl, rcptUrl, error: null };
-    console.log("Schemas READY", { reqUrl, rcptUrl });
+    console.log("Schemas READY");
   } catch (e) {
     validateReq = null;
     validateRcpt = null;
@@ -228,33 +192,53 @@ let ensKeyCache = null; // { pubkey_pem, alg, signer_id, cached_at, expires_at, 
 
 async function getEnsVerifierKey({ refresh = false } = {}) {
   const now = Date.now();
-
-  if (!refresh && ensKeyCache?.pubkey_pem && ensKeyCache?.expires_at && now < ensKeyCache.expires_at) {
+  if (!refresh && ensKeyCache?.pubkey_pem && ensKeyCache?.expires_at && now < Date.parse(ensKeyCache.expires_at)) {
     return { ...ensKeyCache, source: "ens-cache" };
   }
 
-  try {
-    const k = await resolveVerifierKeyFromENS();
-    ensKeyCache = {
-      ...k,
-      cached_at: new Date(now).toISOString(),
-      expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString(),
-      error: null,
-    };
-    return { ...ensKeyCache, source: "ens" };
-  } catch (e) {
-    const err = String(e?.message ?? e);
-    ensKeyCache = {
-      pubkey_pem: ensKeyCache?.pubkey_pem || null,
-      alg: ensKeyCache?.alg || null,
-      signer_id: ensKeyCache?.signer_id || null,
-      cached_at: ensKeyCache?.cached_at || null,
-      expires_at: ensKeyCache?.expires_at || null,
-      error: err,
-    };
-    throw new Error(err);
-  }
+  const k = await resolveVerifierKeyFromENS();
+  ensKeyCache = {
+    ...k,
+    cached_at: new Date(now).toISOString(),
+    expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString(),
+    error: null,
+  };
+  return { ...ensKeyCache, source: "ens" };
 }
+
+/* -------------------- always-on routes -------------------- */
+
+app.get("/health", (_req, res) => res.status(200).send("ok"));
+
+app.get("/debug/env", async (_req, res) => {
+  let signer_ok = false;
+  let signer_error = null;
+
+  try {
+    // sign a dummy hash to prove key is valid
+    const dummy = sha256Hex("debug");
+    signEd25519(dummy);
+    signer_ok = true;
+  } catch (e) {
+    signer_error = String(e?.message ?? e);
+  }
+
+  res.json({
+    ok: true,
+    node: process.version,
+    cwd: process.cwd(),
+    port: PORT,
+    service: SERVICE_NAME,
+    ens_name: ENS_NAME,
+    has_rpc: Boolean(ETH_RPC_URL),
+    signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME,
+    has_priv: Boolean(process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM),
+    has_pub: Boolean(process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM),
+    signer_ok,
+    signer_error,
+    schema_state: schemaState,
+  });
+});
 
 /* -------------------- /verify -------------------- */
 
@@ -267,24 +251,16 @@ app.post("/verify", async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing metadata.proof.signature_b64 or hash_sha256" });
     }
 
-    // 1) schema validation (if we can)
-    let schema_valid = false;
-    let schema_errors = null;
+    // schema validation
+    const schema_valid = validateRcpt ? Boolean(validateRcpt(receipt)) : false;
+    const schema_errors = validateRcpt ? (validateRcpt.errors || null) : [{ message: "receipt validator not ready", schemaState }];
 
-    if (validateRcpt) {
-      schema_valid = Boolean(validateRcpt(receipt));
-      schema_errors = validateRcpt.errors || null;
-    } else {
-      schema_valid = false;
-      schema_errors = [{ message: "receipt validator not ready", schemaState }];
-    }
+    // hash recompute
+    const recomputed_hash = recomputeReceiptHash(receipt);
+    const claimed_hash = String(proof.hash_sha256);
+    const hash_matches = recomputed_hash === claimed_hash;
 
-    // 2) recompute hash
-    const recomputed = recomputeReceiptHash(receipt);
-    const claimed = String(proof.hash_sha256);
-    const hash_matches = recomputed === claimed;
-
-    // 3) choose verifier key
+    // key selection
     const requireEns = String(req.query?.ens || "") === "1";
     const refresh = String(req.query?.refresh || "") === "1";
 
@@ -294,27 +270,21 @@ app.post("/verify", async (req, res) => {
     if (requireEns) {
       const k = await getEnsVerifierKey({ refresh });
       pubPem = k.pubkey_pem;
-      pubkey_source = k.source === "ens-cache" ? "ens-cache" : "ens";
+      pubkey_source = k.source; // ens or ens-cache
     } else {
-      // fast path: env public key only
       pubPem = readPemEnv("RECEIPT_SIGNING_PUBLIC_KEY_PEM");
       pubkey_source = pubPem ? "env" : null;
     }
 
     if (!pubPem) {
-      return res.status(503).json({
-        ok: false,
-        error: requireEns ? "ENS verifier key unavailable" : "Missing RECEIPT_SIGNING_PUBLIC_KEY_PEM",
-        ens_error: ensKeyCache?.error || null,
-      });
+      return res.status(503).json({ ok: false, error: requireEns ? "ENS verifier key unavailable" : "Missing env verifier key" });
     }
 
-    // 4) verify signature (Ed25519 over hashHex bytes)
+    // signature verify (ed25519 over hash bytes)
     let signature_valid = false;
     let signature_error = null;
-
     try {
-      const msg = Buffer.from(recomputed, "hex");
+      const msg = Buffer.from(recomputed_hash, "hex");
       const sig = Buffer.from(proof.signature_b64, "base64");
       signature_valid = crypto.verify(null, msg, pubPem, sig);
     } catch (e) {
@@ -329,8 +299,8 @@ app.post("/verify", async (req, res) => {
         signer_id: proof.signer_id || null,
         alg: proof.alg || null,
         canonical: proof.canonical || null,
-        claimed_hash: claimed,
-        recomputed_hash: recomputed,
+        claimed_hash,
+        recomputed_hash,
         pubkey_source,
       },
       errors: { schema_errors, signature_error },
@@ -379,12 +349,7 @@ app.post(REQUEST_PATH, async (req, res) => {
     const receipt = {
       status: "success",
       x402: request.x402,
-      trace: {
-        trace_id,
-        started_at,
-        completed_at: new Date().toISOString(),
-        provider: SERVICE_NAME,
-      },
+      trace: { trace_id, started_at, completed_at: new Date().toISOString(), provider: SERVICE_NAME },
       result: {
         items: [
           {
@@ -400,7 +365,8 @@ app.post(REQUEST_PATH, async (req, res) => {
       },
     };
 
-    attachReceiptProof(receipt);
+    // If signing fails, fail loudly. No silent unsigned receipts.
+    attachReceiptProofOrThrow(receipt);
 
     if (!validateRcpt(receipt)) {
       return res.status(500).json({ error: "receipt schema invalid", details: validateRcpt.errors });
@@ -408,38 +374,8 @@ app.post(REQUEST_PATH, async (req, res) => {
 
     return res.json(receipt);
   } catch (e) {
-    const receipt = {
-      status: "error",
-      x402: {
-        entry: "x402://fetchagent.eth/fetch/v1.0.0",
-        verb: "fetch",
-        version: "1.0.0",
-      },
-      trace: {
-        trace_id: id("trace"),
-        started_at: new Date().toISOString(),
-        completed_at: new Date().toISOString(),
-        provider: SERVICE_NAME,
-      },
-      error: {
-        code: "RUNTIME_ERROR",
-        message: String(e?.message ?? e),
-        retryable: true,
-      },
-      result: { items: [] },
-    };
-
-    try {
-      attachReceiptProof(receipt);
-    } catch {
-      // if signing fails, still respond with a non-signed receipt
-    }
-
-    if (validateRcpt && !validateRcpt(receipt)) {
-      return res.status(500).json({ error: "receipt schema invalid (error path)", details: validateRcpt.errors });
-    }
-
-    return res.status(200).json(receipt);
+    // If we error before we can sign, return a clear runtime error (not a fake receipt).
+    return res.status(500).json({ error: "runtime_error", message: String(e?.message ?? e) });
   }
 });
 
@@ -449,5 +385,4 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`listening on ${PORT}`);
 });
 
-// Non-blocking init
 initSchemas();
