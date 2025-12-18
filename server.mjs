@@ -35,7 +35,7 @@ function sha256Hex(s) {
 }
 
 function canonicalJson(obj) {
-  // v1: stable-enough canonicalization
+  // v1: stable-enough canonicalization (JSON.stringify)
   return JSON.stringify(obj);
 }
 
@@ -71,7 +71,18 @@ function attachReceiptProofOrThrow(receipt) {
     signature_b64: signEd25519(hash)
   };
 
+  // hard guarantee: never emit unsigned receipts
+  if (!receipt.metadata.proof.signature_b64 || !receipt.metadata.proof.hash_sha256) {
+    throw new Error("INTERNAL: receipt proof missing after signing");
+  }
+
   return receipt;
+}
+
+function verifyEd25519(hashHex, sigB64, pubPem) {
+  const msg = Buffer.from(hashHex, "hex");
+  const sig = Buffer.from(sigB64, "base64");
+  return crypto.verify(null, msg, { key: pubPem }, sig);
 }
 
 // SSRF guard (demo safety)
@@ -202,16 +213,27 @@ async function getEnsVerifierKey({ refresh = false } = {}) {
   if (!refresh && cacheValid()) return { ...ensKeyCache, source: "ens-cache" };
 
   const now = Date.now();
-  const k = await resolveVerifierKeyFromENS();
-
-  ensKeyCache = {
-    ...k,
-    cached_at: new Date(now).toISOString(),
-    expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString(),
-    error: null
-  };
-
-  return { ...ensKeyCache, source: "ens" };
+  try {
+    const k = await resolveVerifierKeyFromENS();
+    ensKeyCache = {
+      ...k,
+      cached_at: new Date(now).toISOString(),
+      expires_at: new Date(now + ENS_CACHE_TTL_MS).toISOString(),
+      error: null
+    };
+    return { ...ensKeyCache, source: "ens" };
+  } catch (e) {
+    const err = String(e?.message ?? e);
+    ensKeyCache = {
+      alg: null,
+      signer_id: null,
+      pubkey_pem: null,
+      cached_at: new Date(now).toISOString(),
+      expires_at: new Date(now + Math.min(ENS_CACHE_TTL_MS, 60_000)).toISOString(), // retry soon
+      error: err
+    };
+    throw new Error(err);
+  }
 }
 
 /* -------------------- always-on routes -------------------- */
@@ -229,6 +251,8 @@ app.get("/debug/env", (_req, res) => {
     signer_error = String(e?.message ?? e);
   }
 
+  const pubEnv = readPemB64Env("RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64");
+
   res.json({
     ok: true,
     node: process.version,
@@ -237,15 +261,17 @@ app.get("/debug/env", (_req, res) => {
     service: SERVICE_NAME,
     ens_name: ENS_NAME,
     has_rpc: Boolean(ETH_RPC_URL),
+
     signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME,
-
-    has_priv_b64: Boolean(process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64),
-    has_pub_b64: Boolean(process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64),
-
     signer_ok,
     signer_error,
 
+    has_priv_b64: Boolean(process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64),
+    has_pub_b64: Boolean(process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64),
+    pub_env_preview: pubEnv ? pubEnv.slice(0, 30) + "..." : null,
+
     schema_state: schemaState,
+
     ens_verifier_cache: {
       has_key: Boolean(ensKeyCache?.pubkey_pem),
       cached_at: ensKeyCache?.cached_at || null,
@@ -284,18 +310,15 @@ app.post("/verify", async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing metadata.proof.signature_b64 or hash_sha256" });
     }
 
-    // schema check
     const schema_valid = validateRcpt ? Boolean(validateRcpt(receipt)) : false;
     const schema_errors = validateRcpt
       ? (validateRcpt.errors || null)
       : [{ message: "receipt validator not ready", schemaState }];
 
-    // hash check
     const recomputed_hash = recomputeReceiptHash(receipt);
     const claimed_hash = String(proof.hash_sha256);
     const hash_matches = recomputed_hash === claimed_hash;
 
-    // key selection (IMPORTANT: ?ens=1 forces ENS key; no receipt key ever)
     const requireEns = String(req.query?.ens || "") === "1";
     const refresh = String(req.query?.refresh || "") === "1";
 
@@ -305,7 +328,7 @@ app.post("/verify", async (req, res) => {
     if (requireEns) {
       const k = await getEnsVerifierKey({ refresh });
       pubPem = k.pubkey_pem;
-      pubkey_source = k.source; // ens / ens-cache
+      pubkey_source = k.source;
     } else {
       pubPem = readPemB64Env("RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64");
       pubkey_source = pubPem ? "env-b64" : null;
@@ -318,13 +341,10 @@ app.post("/verify", async (req, res) => {
       });
     }
 
-    // signature check (ed25519 over hash bytes)
     let signature_valid = false;
     let signature_error = null;
     try {
-      const msg = Buffer.from(recomputed_hash, "hex");
-      const sig = Buffer.from(proof.signature_b64, "base64");
-      signature_valid = crypto.verify(null, msg, { key: pubPem }, sig);
+      signature_valid = verifyEd25519(recomputed_hash, proof.signature_b64, pubPem);
     } catch (e) {
       signature_error = String(e?.message ?? e);
       signature_valid = false;
@@ -354,6 +374,8 @@ app.post(REQUEST_PATH, async (req, res) => {
   if (!validateReq || !validateRcpt) {
     return res.status(503).json({ error: "schemas not ready", schema: schemaState });
   }
+
+  const t0 = Date.now();
 
   try {
     const request = req.body;
@@ -391,6 +413,7 @@ app.post(REQUEST_PATH, async (req, res) => {
         trace_id,
         started_at,
         completed_at: new Date().toISOString(),
+        duration_ms: Date.now() - t0,
         provider: SERVICE_NAME
       },
       result: {
@@ -408,7 +431,6 @@ app.post(REQUEST_PATH, async (req, res) => {
       }
     };
 
-    // NO silent unsigned receipts
     attachReceiptProofOrThrow(receipt);
 
     if (!validateRcpt(receipt)) {
@@ -417,7 +439,15 @@ app.post(REQUEST_PATH, async (req, res) => {
 
     return res.json(receipt);
   } catch (e) {
-    return res.status(500).json({ error: "runtime_error", message: String(e?.message ?? e) });
+    const msg = String(e?.message ?? e);
+    return res.status(500).json({
+      error: "runtime_error",
+      message: msg,
+      hint:
+        msg.includes("DECODER") || msg.includes("decoder") || msg.includes("PEM") || msg.includes("Missing RECEIPT_")
+          ? "Signing key misconfigured (check *_PEM_B64 vars)."
+          : null
+    });
   }
 });
 
