@@ -35,10 +35,12 @@ function sha256Hex(s) {
 function readPemEnv(name) {
   const v = process.env[name];
   if (!v) return null;
+  // Railway-safe: allow multiline PEM stored with literal \n
   return v.replace(/\\n/g, "\n").trim();
 }
 
 function canonicalJson(obj) {
+  // v1: stable enough for now
   return JSON.stringify(obj);
 }
 
@@ -74,6 +76,17 @@ function attachReceiptProof(receipt) {
   }
 
   return receipt;
+}
+
+function stripProofForHash(receipt) {
+  const clone = structuredClone(receipt);
+  if (clone?.metadata?.proof) delete clone.metadata.proof;
+  return clone;
+}
+
+function recomputeReceiptHash(receipt) {
+  const clone = stripProofForHash(receipt);
+  return sha256Hex(canonicalJson(clone));
 }
 
 // SSRF guard for demo safety
@@ -112,7 +125,7 @@ let validateRcpt = null;
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 app.get("/debug/env", (_req, res) => {
-  // must never 500
+  // must never 500 — your lifeline
   try {
     res.status(200).json({
       ok: true,
@@ -137,6 +150,90 @@ app.get("/debug/env", (_req, res) => {
 app.post("/debug/reload-schemas", async (_req, res) => {
   await initSchemas();
   res.status(200).json({ ok: true, schema_state: schemaState });
+});
+
+/* -------------------- /verify -------------------- */
+
+app.post("/verify", (req, res) => {
+  const receipt = req.body;
+
+  if (!receipt || typeof receipt !== "object") {
+    return res.status(400).json({ ok: false, error: "body must be a receipt object" });
+  }
+
+  const proof = receipt?.metadata?.proof || null;
+
+  // 1) schema validation (if validator is loaded)
+  let schema_valid = null;
+  let schema_errors = null;
+  if (validateRcpt) {
+    schema_valid = Boolean(validateRcpt(receipt));
+    if (!schema_valid) schema_errors = validateRcpt.errors;
+  }
+
+  // 2) recompute hash (authoritative)
+  const recomputed_hash = recomputeReceiptHash(receipt);
+  const claimed_hash = proof?.hash_sha256 || null;
+  const hash_matches = claimed_hash ? recomputed_hash === claimed_hash : null;
+
+  // 3) signature verification (verify against recomputed hash)
+  let signature_valid = null;
+  let signature_error = null;
+  let pubkey_source = null;
+
+  try {
+    if (!proof?.signature_b64) {
+      signature_valid = null;
+      signature_error = "missing metadata.proof.signature_b64";
+    } else if (!claimed_hash) {
+      signature_valid = null;
+      signature_error = "missing metadata.proof.hash_sha256";
+    } else {
+      const pubPem =
+        proof?.public_key_pem ||
+        readPemEnv("RECEIPT_SIGNING_PUBLIC_KEY_PEM");
+
+      if (!pubPem) {
+        signature_valid = null;
+        signature_error =
+          "no public key available (set RECEIPT_SIGNING_PUBLIC_KEY_PEM or include proof.public_key_pem)";
+      } else {
+        pubkey_source = proof?.public_key_pem ? "receipt" : "env";
+        const msg = Buffer.from(recomputed_hash, "hex");
+        const sig = Buffer.from(proof.signature_b64, "base64");
+        signature_valid = crypto.verify(null, msg, pubPem, sig);
+      }
+    }
+  } catch (e) {
+    signature_valid = false;
+    signature_error = String(e?.message ?? e);
+  }
+
+  const ok =
+    (schema_valid !== false) &&
+    (hash_matches !== false) &&
+    (signature_valid !== false);
+
+  return res.status(200).json({
+    ok,
+    checks: {
+      schema_valid,
+      hash_matches,
+      signature_valid
+    },
+    values: {
+      signer_id: proof?.signer_id || null,
+      alg: proof?.alg || null,
+      canonical: proof?.canonical || null,
+      claimed_hash,
+      recomputed_hash,
+      pubkey_source
+    },
+    errors: {
+      schema_errors,
+      signature_error
+    }
+  });
 });
 
 /* -------------------- ENS resolution -------------------- */
@@ -222,7 +319,10 @@ app.post(REQUEST_PATH, async (req, res) => {
     const request = req.body;
 
     if (!validateReq(request)) {
-      return res.status(400).json({ error: "request schema invalid", details: validateReq.errors });
+      return res.status(400).json({
+        error: "request schema invalid",
+        details: validateReq.errors
+      });
     }
 
     const url = request.source;
@@ -248,7 +348,7 @@ app.post(REQUEST_PATH, async (req, res) => {
     const headers = {};
     r.headers.forEach((v, k) => (headers[k] = v));
 
-    // IMPORTANT: metadata is TOP-LEVEL (base schema), not inside result.
+    // IMPORTANT: metadata is TOP-LEVEL (base schema), never inside result.
     const receipt = {
       status: "success",
       x402: request.x402,
@@ -272,7 +372,10 @@ app.post(REQUEST_PATH, async (req, res) => {
     attachReceiptProof(receipt);
 
     if (!validateRcpt(receipt)) {
-      return res.status(500).json({ error: "receipt schema invalid", details: validateRcpt.errors });
+      return res.status(500).json({
+        error: "receipt schema invalid",
+        details: validateRcpt.errors
+      });
     }
 
     return res.json(receipt);
@@ -289,7 +392,10 @@ app.post(REQUEST_PATH, async (req, res) => {
     attachReceiptProof(receipt);
 
     if (validateRcpt && !validateRcpt(receipt)) {
-      return res.status(500).json({ error: "receipt schema invalid (error path)", details: validateRcpt.errors });
+      return res.status(500).json({
+        error: "receipt schema invalid (error path)",
+        details: validateRcpt.errors
+      });
     }
 
     return res.status(200).json(receipt);
