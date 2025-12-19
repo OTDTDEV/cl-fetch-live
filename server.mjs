@@ -35,7 +35,7 @@ function sha256Hex(s) {
 }
 
 function canonicalJson(obj) {
-  // v1: stable-enough canonicalization (JSON.stringify)
+  // v1: stable-enough canonicalization
   return JSON.stringify(obj);
 }
 
@@ -71,7 +71,6 @@ function attachReceiptProofOrThrow(receipt) {
     signature_b64: signEd25519(hash)
   };
 
-  // hard guarantee: never emit unsigned receipts
   if (!receipt.metadata.proof.signature_b64 || !receipt.metadata.proof.hash_sha256) {
     throw new Error("INTERNAL: receipt proof missing after signing");
   }
@@ -229,7 +228,7 @@ async function getEnsVerifierKey({ refresh = false } = {}) {
       signer_id: null,
       pubkey_pem: null,
       cached_at: new Date(now).toISOString(),
-      expires_at: new Date(now + Math.min(ENS_CACHE_TTL_MS, 60_000)).toISOString(), // retry soon
+      expires_at: new Date(now + Math.min(ENS_CACHE_TTL_MS, 60_000)).toISOString(),
       error: err
     };
     throw new Error(err);
@@ -261,6 +260,9 @@ app.get("/debug/env", (_req, res) => {
     service: SERVICE_NAME,
     ens_name: ENS_NAME,
     has_rpc: Boolean(ETH_RPC_URL),
+
+    // PROVE we are on the right Railway service/environment
+    ping_test: process.env.PING_TEST || null,
 
     signer_id: process.env.RECEIPT_SIGNER_ID?.trim() || SERVICE_NAME,
     signer_ok,
@@ -445,7 +447,7 @@ app.post(REQUEST_PATH, async (req, res) => {
       message: msg,
       hint:
         msg.includes("DECODER") || msg.includes("decoder") || msg.includes("PEM") || msg.includes("Missing RECEIPT_")
-          ? "Signing key misconfigured (check *_PEM_B64 vars)."
+          ? "Signing key misconfigured (check *_PEM_B64 vars and redeploy)."
           : null
     });
   }
