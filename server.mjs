@@ -47,7 +47,15 @@ function readPemB64Env(name) {
 
 function recomputeReceiptHash(receipt) {
   const clone = structuredClone(receipt);
+
+  // remove proof
   if (clone?.metadata?.proof) delete clone.metadata.proof;
+
+  // IMPORTANT: if metadata is now empty, delete it too
+  if (clone?.metadata && typeof clone.metadata === "object" && Object.keys(clone.metadata).length === 0) {
+    delete clone.metadata;
+  }
+
   return sha256Hex(canonicalJson(clone));
 }
 
